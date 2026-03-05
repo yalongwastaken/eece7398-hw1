@@ -1,4 +1,5 @@
-**/data/
+**/data/*
+!**/data/download_data.py
 **/out/
 **/__pycache__/
 **/*.pyc
