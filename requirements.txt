@@ -4,4 +4,6 @@ numpy
 pillow
 tqdm
 datasets
-huggingface_hub
+huggingface_hubdiffusers
+accelerate
+transformers
