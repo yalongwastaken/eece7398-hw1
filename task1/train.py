@@ -35,7 +35,8 @@ def main():
     train_ds_full = ImageFolderNumeric(TRAIN_DIR, transform=train_tf)
     val_ds        = ImageFolderNumeric(VAL_DIR,   transform=val_tf)
     cat_mapped    = get_cat_indices(val_ds)
-    train_ds_cat  = get_cat_subset(train_ds_full, set(range(len(train_ds_full.classes))))
+    # train dir only has cat classes so use the full dataset directly
+    train_ds_cat  = train_ds_full
 
     train_loader = DataLoader(train_ds_cat, batch_size=args.batch_size,
                               shuffle=True, num_workers=args.workers,
