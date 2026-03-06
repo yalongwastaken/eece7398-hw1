@@ -38,9 +38,11 @@ def main():
     train_ds_cat  = get_cat_subset(train_ds_full, set(range(len(train_ds_full.classes))))
 
     train_loader = DataLoader(train_ds_cat, batch_size=args.batch_size,
-                              shuffle=True, num_workers=args.workers)
+                              shuffle=True, num_workers=args.workers,
+                              pin_memory=True)
     val_loader   = DataLoader(val_ds, batch_size=args.batch_size,
-                              shuffle=False, num_workers=args.workers)
+                              shuffle=False, num_workers=args.workers,
+                              pin_memory=True)
 
     print(f"cat training images : {len(train_ds_cat)}")
     print(f"val images          : {len(val_ds)}")
@@ -50,6 +52,7 @@ def main():
     model     = model.to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scaler    = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     # resume from checkpoint if provided
     start_epoch  = 0
@@ -75,10 +78,12 @@ def main():
         for imgs, labels in tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}"):
             imgs, labels = imgs.to(device), labels.to(device)
             optimizer.zero_grad()
-            out  = model(imgs)
-            loss = criterion(out, labels)
-            loss.backward()
-            optimizer.step()
+            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+                out  = model(imgs)
+                loss = criterion(out, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             total_loss += loss.item() * labels.size(0)
             correct    += (out.argmax(1) == labels).sum().item()
             total      += labels.size(0)
