@@ -15,22 +15,114 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, models, transforms
 from tqdm import tqdm
 
-DATA_DIR   = Path(__file__).parent.parent / "data"
-TRAIN_DIR  = DATA_DIR / "train"
-VAL_DIR    = DATA_DIR / "val"
-CKPT_DIR   = Path(__file__).parent / "checkpoints"
+DATA_DIR  = Path(__file__).parent.parent / "data"
+TRAIN_DIR = DATA_DIR / "train"
+VAL_DIR   = DATA_DIR / "val"
+CKPT_DIR  = Path(__file__).parent / "checkpoints"
 
 CAT_LABELS = list(range(281, 294))  # 281-293 inclusive
 
 
+def main():
+    args = get_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device: {device}")
+    print(f"batch_size={args.batch_size}  lr={args.lr}  epochs={args.epochs}")
+
+    train_tf, val_tf = get_transforms()
+
+    # load datasets
+    train_ds_full = ImageFolderNumeric(TRAIN_DIR, transform=train_tf)
+    val_ds        = ImageFolderNumeric(VAL_DIR,   transform=val_tf)
+    cat_mapped    = get_cat_indices(val_ds)
+    train_ds_cat  = get_cat_subset(train_ds_full, set(range(len(train_ds_full.classes))))
+
+    train_loader = DataLoader(train_ds_cat, batch_size=args.batch_size,
+                              shuffle=True, num_workers=args.workers)
+    val_loader   = DataLoader(val_ds, batch_size=args.batch_size,
+                              shuffle=False, num_workers=args.workers)
+
+    print(f"cat training images : {len(train_ds_cat)}")
+    print(f"val images          : {len(val_ds)}")
+
+    # load pretrained resnet50
+    model     = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+    model     = model.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    # resume from checkpoint if provided
+    start_epoch  = 0
+    baseline_all = None
+    if args.resume:
+        start_epoch, baseline_all = load_checkpoint(args.resume, model, optimizer, device)
+
+    # baseline eval — skip if resuming or --no-baseline passed
+    if baseline_all is None and not args.no_baseline:
+        print("\n--- baseline (before training) ---")
+        baseline_all, baseline_cat = evaluate(model, val_loader, cat_mapped, device)
+        print(f"overall acc : {baseline_all:.2f}%")
+        print(f"cat acc     : {baseline_cat:.2f}%")
+    elif baseline_all is None:
+        print("skipping baseline eval")
+        baseline_all = 0.0
+
+    # continual learning loop
+    for epoch in range(start_epoch + 1, args.epochs + 1):
+        model.train()
+        total_loss = correct = total = 0
+        t0 = time.time()
+        for imgs, labels in tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}"):
+            imgs, labels = imgs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            out  = model(imgs)
+            loss = criterion(out, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * labels.size(0)
+            correct    += (out.argmax(1) == labels).sum().item()
+            total      += labels.size(0)
+
+        train_acc  = correct / total * 100
+        train_loss = total_loss / total
+        elapsed    = time.time() - t0
+
+        acc_all, acc_cat = evaluate(model, val_loader, cat_mapped, device)
+        degradation = baseline_all - acc_all
+
+        print(f"\nepoch {epoch} | loss {train_loss:.4f} | train acc {train_acc:.2f}%"
+              f" | time {elapsed:.1f}s")
+        print(f"  val overall : {acc_all:.2f}%  (degradation: {degradation:.3f}%)")
+        print(f"  val cat     : {acc_cat:.2f}%")
+
+        save_checkpoint(model, optimizer, epoch, baseline_all, args)
+
+    print("\ndone.")
+
+
+# --- helpers ---
+
+class ImageFolderNumeric(datasets.ImageFolder):
+    # sorts integer-named folders numerically instead of alphabetically
+    def find_classes(self, directory):
+        classes = sorted(
+            [d.name for d in os.scandir(directory) if d.is_dir()],
+            key=lambda x: int(x)
+        )
+        class_to_idx = {cls: int(cls) for cls in classes}
+        return classes, class_to_idx
+
+
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--batch-size", type=int,   default=32)
-    p.add_argument("--lr",         type=float, default=1e-4)
-    p.add_argument("--epochs",     type=int,   default=5)
-    p.add_argument("--workers",    type=int,   default=2)
-    p.add_argument("--resume",     type=str,   default=None,
+    p.add_argument("--batch-size",   type=int,   default=32)
+    p.add_argument("--lr",           type=float, default=1e-4)
+    p.add_argument("--epochs",       type=int,   default=5)
+    p.add_argument("--workers",      type=int,   default=2)
+    p.add_argument("--resume",       type=str,   default=None,
                    help="path to checkpoint to resume from")
+    p.add_argument("--no-baseline",  action="store_true",
+                   help="skip baseline eval (use when you already know it)")
     return p.parse_args()
 
 
@@ -54,10 +146,8 @@ def get_transforms():
 
 
 def get_cat_indices(dataset):
-    # ImageFolder remaps folder names to 0-based indices
-    # cat folders are named '281'-'293', mapped to whatever ImageFolder assigns
-    cat_mapped = {v for k, v in dataset.class_to_idx.items() if k in [str(l) for l in CAT_LABELS]}
-    return cat_mapped
+    return {v for k, v in dataset.class_to_idx.items()
+            if k in [str(l) for l in CAT_LABELS]}
 
 
 def get_cat_subset(dataset, cat_mapped):
@@ -92,7 +182,7 @@ def evaluate(model, loader, cat_mapped, device):
     with torch.no_grad():
         for imgs, labels in tqdm(loader, desc="evaluating", leave=False):
             imgs, labels = imgs.to(device), labels.to(device)
-            out  = model(imgs)
+            out   = model(imgs)
             preds = out.argmax(dim=1)
             correct_all += (preds == labels).sum().item()
             total_all   += labels.size(0)
@@ -103,83 +193,6 @@ def evaluate(model, loader, cat_mapped, device):
     acc_all = correct_all / total_all * 100
     acc_cat = correct_cat / total_cat * 100 if total_cat else 0
     return acc_all, acc_cat
-
-
-def main():
-    args = get_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device: {device}")
-    print(f"batch_size={args.batch_size}  lr={args.lr}  epochs={args.epochs}")
-
-    train_tf, val_tf = get_transforms()
-
-    # load datasets
-    train_ds_full = datasets.ImageFolder(TRAIN_DIR, transform=train_tf)
-    val_ds        = datasets.ImageFolder(VAL_DIR,   transform=val_tf)
-    cat_mapped    = get_cat_indices(val_ds)  # use val since it has all 1000 classes
-    train_ds_cat  = get_cat_subset(train_ds_full, set(range(len(train_ds_full.classes))))
-
-    cat_mapped    = get_cat_indices(val_ds)
-    train_ds_cat  = get_cat_subset(train_ds_full, set(range(len(train_ds_full.classes))))
-
-    train_loader = DataLoader(train_ds_cat, batch_size=args.batch_size,
-                              shuffle=True, num_workers=args.workers)
-    val_loader   = DataLoader(val_ds, batch_size=args.batch_size,
-                              shuffle=False, num_workers=args.workers)
-
-    print(f"cat training images : {len(train_ds_cat)}")
-    print(f"val images          : {len(val_ds)}")
-
-    # load pretrained resnet50
-    model     = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-    model     = model.to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-
-    # resume from checkpoint if provided
-    start_epoch  = 0
-    baseline_all = None
-    if args.resume:
-        start_epoch, baseline_all = load_checkpoint(args.resume, model, optimizer, device)
-
-    # baseline eval before any training
-    if baseline_all is None:
-        print("\n--- baseline (before training) ---")
-        baseline_all, baseline_cat = evaluate(model, val_loader, cat_mapped, device)
-        print(f"overall acc : {baseline_all:.2f}%")
-        print(f"cat acc     : {baseline_cat:.2f}%")
-
-    # continual learning loop
-    for epoch in range(start_epoch + 1, args.epochs + 1):
-        model.train()
-        total_loss = correct = total = 0
-        t0 = time.time()
-        for imgs, labels in tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}"):
-            imgs, labels = imgs.to(device), labels.to(device)
-            optimizer.zero_grad()
-            out  = model(imgs)
-            loss = criterion(out, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * labels.size(0)
-            correct    += (out.argmax(1) == labels).sum().item()
-            total      += labels.size(0)
-
-        train_acc  = correct / total * 100
-        train_loss = total_loss / total
-        elapsed    = time.time() - t0
-
-        acc_all, acc_cat = evaluate(model, val_loader, cat_mapped, device)
-        degradation = baseline_all - acc_all
-
-        print(f"\nepoch {epoch} | loss {train_loss:.4f} | train acc {train_acc:.2f}%"
-              f" | time {elapsed:.1f}s")
-        print(f"  val overall : {acc_all:.2f}%  (degradation: {degradation:.3f}%)")
-        print(f"  val cat     : {acc_cat:.2f}%")
-
-        save_checkpoint(model, optimizer, epoch, baseline_all, args)
-
-    print("\ndone.")
 
 
 if __name__ == "__main__":
