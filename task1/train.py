@@ -53,8 +53,15 @@ def get_transforms():
     return train_tf, val_tf
 
 
-def get_cat_subset(dataset):
-    indices = [i for i, (_, lbl) in enumerate(dataset.samples) if lbl in CAT_LABELS]
+def get_cat_indices(dataset):
+    # ImageFolder remaps folder names to 0-based indices
+    # cat folders are named '281'-'293', mapped to whatever ImageFolder assigns
+    cat_mapped = {v for k, v in dataset.class_to_idx.items() if k in [str(l) for l in CAT_LABELS]}
+    return cat_mapped
+
+
+def get_cat_subset(dataset, cat_mapped):
+    indices = [i for i, (_, lbl) in enumerate(dataset.samples) if lbl in cat_mapped]
     return Subset(dataset, indices)
 
 
@@ -79,7 +86,7 @@ def load_checkpoint(path, model, optimizer, device):
     return ckpt["epoch"], ckpt["baseline_all"]
 
 
-def evaluate(model, loader, device):
+def evaluate(model, loader, cat_mapped, device):
     model.eval()
     correct_cat = total_cat = correct_all = total_all = 0
     with torch.no_grad():
@@ -89,7 +96,7 @@ def evaluate(model, loader, device):
             preds = out.argmax(dim=1)
             correct_all += (preds == labels).sum().item()
             total_all   += labels.size(0)
-            cat_mask = torch.tensor([l.item() in CAT_LABELS for l in labels], device=device)
+            cat_mask = torch.tensor([l.item() in cat_mapped for l in labels], device=device)
             if cat_mask.any():
                 correct_cat += (preds[cat_mask] == labels[cat_mask]).sum().item()
                 total_cat   += cat_mask.sum().item()
@@ -109,7 +116,11 @@ def main():
     # load datasets
     train_ds_full = datasets.ImageFolder(TRAIN_DIR, transform=train_tf)
     val_ds        = datasets.ImageFolder(VAL_DIR,   transform=val_tf)
-    train_ds_cat  = get_cat_subset(train_ds_full)
+    cat_mapped    = get_cat_indices(val_ds)  # use val since it has all 1000 classes
+    train_ds_cat  = get_cat_subset(train_ds_full, set(range(len(train_ds_full.classes))))
+
+    cat_mapped    = get_cat_indices(val_ds)
+    train_ds_cat  = get_cat_subset(train_ds_full, set(range(len(train_ds_full.classes))))
 
     train_loader = DataLoader(train_ds_cat, batch_size=args.batch_size,
                               shuffle=True, num_workers=args.workers)
@@ -134,7 +145,7 @@ def main():
     # baseline eval before any training
     if baseline_all is None:
         print("\n--- baseline (before training) ---")
-        baseline_all, baseline_cat = evaluate(model, val_loader, device)
+        baseline_all, baseline_cat = evaluate(model, val_loader, cat_mapped, device)
         print(f"overall acc : {baseline_all:.2f}%")
         print(f"cat acc     : {baseline_cat:.2f}%")
 
@@ -158,7 +169,7 @@ def main():
         train_loss = total_loss / total
         elapsed    = time.time() - t0
 
-        acc_all, acc_cat = evaluate(model, val_loader, device)
+        acc_all, acc_cat = evaluate(model, val_loader, cat_mapped, device)
         degradation = baseline_all - acc_all
 
         print(f"\nepoch {epoch} | loss {train_loss:.4f} | train acc {train_acc:.2f}%"
